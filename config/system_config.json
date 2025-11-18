@@ -1,0 +1,50 @@
+{
+    "variant_6": {
+        "sources": {
+            "type": "infinite",
+            "count": 2,
+            "distribution": "uniform",
+            "params": {
+                "source_0": {
+                    "min_interval": 1.0,
+                    "max_interval": 3.0
+                },
+                "source_1": {
+                    "min_interval": 1.5,
+                    "max_interval": 4.0
+                }
+            },
+            "priorities": [
+                1,
+                2
+            ]
+        },
+        "device": {
+            "distribution": "exponential",
+            "lambda": 0.5,
+            "tau_range": {
+                "min": 1.0,
+                "max": 2.0,
+                "step": 0.2
+            }
+        },
+        "buffer": {
+            "size": 4,
+            "disciplines": {
+                "write": "D10Z2",
+                "reject": "D10O2",
+                "select_request": "D2B5",
+                "select_device": "D2P2"
+            }
+        },
+        "simulation": {
+            "confidence_level": 0.9,
+            "relative_error": 0.1,
+            "min_requests": 1000
+        },
+        "visualization": {
+            "step_mode": "OD3",
+            "result_mode": "OR1"
+        }
+    }
+}
