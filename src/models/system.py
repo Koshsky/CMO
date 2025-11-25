@@ -9,9 +9,10 @@ from src.utils.distributions import uniform_distribution, exponential_distributi
 
 class Source:
     """Класс источника заявок"""
-    def __init__(self, source_id: int, params: Dict[str, float]):
+    def __init__(self, source_id: int, min_interval: float, max_interval: float):
         self.id = source_id
-        self.params = params
+        self.min_interval = min_interval
+        self.max_interval = max_interval
         self.generated_count = 0
         self.processed_count = 0
         self.rejected_count = 0
@@ -20,7 +21,7 @@ class Source:
 
     def generate_interval(self) -> float:
         """Генерация интервала между заявками по закону ИЗ2 (равномерный)"""
-        return uniform_distribution(self.params['min_interval'], self.params['max_interval'])
+        return uniform_distribution(self.min_interval, self.max_interval)
 
     def __str__(self):
         return f"И{self.id+1}"
@@ -40,7 +41,7 @@ class Device:
         return exponential_distribution(self.service_lambda)
 
     def __str__(self):
-        if self.is_busy:
+        if self.is_busy and self.current_source is not None:
             return f"П{self.id+1}[И{self.current_source.id+1}]"
         else:
             return f"П{self.id+1}[...]"
@@ -58,22 +59,11 @@ class SMOSystem:
         self.buffer_capacity = self.config['buffer']['size']
         self.min_requests = self.config['simulation']['min_requests']
         
-        # Инициализация источников
-        self.sources = []
-        sources_config = self.config['sources']
-        for i in range(sources_config['count']):
-            source_params = sources_config['params'][f'source_{i}']
-            self.sources.append(Source(i, source_params))
+        # Упрощенная инициализация источников
+        self.sources = self._initialize_sources()
         
-        # Инициализация приборов - с проверкой наличия count
-        self.devices = []
-        device_config = self.config['device']
-        
-        # Определяем количество приборов (по умолчанию 2 для варианта №6)
-        devices_count = device_config.get('count', 2)
-        
-        for i in range(devices_count):
-            self.devices.append(Device(i, device_config['lambda']))
+        # Инициализация приборов
+        self.devices = self._initialize_devices()
         
         # Дисциплины
         self.disciplines = self.config['buffer']['disciplines']
@@ -85,6 +75,45 @@ class SMOSystem:
         self.realization_results = []
         
         print(f"Система инициализирована: {len(self.sources)} источников, {len(self.devices)} приборов")
+
+    def _initialize_sources(self) -> List[Source]:
+        """Упрощенная инициализация источников"""
+        sources_config = self.config['sources']
+        sources_count = sources_config['count']
+        sources = []
+        
+        # Получаем параметры интервалов (можно задать общие или для каждого источника)
+        if 'intervals' in sources_config:
+            # Общие параметры для всех источников
+            intervals = sources_config['intervals']
+            min_interval = intervals['min']
+            max_interval = intervals['max']
+            
+            for i in range(sources_count):
+                sources.append(Source(i, min_interval, max_interval))
+        else:
+            # Индивидуальные параметры для каждого источника (обратная совместимость)
+            for i in range(sources_count):
+                source_key = f'source_{i}'
+                if source_key in sources_config['params']:
+                    params = sources_config['params'][source_key]
+                    sources.append(Source(i, params['min_interval'], params['max_interval']))
+                else:
+                    # Параметры по умолчанию, если для источника не заданы
+                    sources.append(Source(i, 1.0, 3.0))
+        
+        return sources
+
+    def _initialize_devices(self) -> List[Device]:
+        """Инициализация приборов"""
+        device_config = self.config['device']
+        devices_count = device_config.get('count', 2)
+        devices = []
+        
+        for i in range(devices_count):
+            devices.append(Device(i, device_config['lambda']))
+        
+        return devices
 
     def initialize_realization(self):
         """Инициализация переменных для одной реализации"""
@@ -108,11 +137,11 @@ class SMOSystem:
         # Буфер
         self.INDBUF = 0
         self.BUFT = [0.0] * self.buffer_capacity
-        self.BUFN = [-1] * self.buffer_capacity  # -1 означает пустой слот
+        self.BUFN = [-1] * self.buffer_capacity
         
         # Вспомогательные переменные
-        self.KOTK = 0  # Общий счетчик отказов
-        self.TOG = [0.0] * len(self.sources)  # Суммарное время ожидания по источникам
+        self.KOTK = 0
+        self.TOG = [0.0] * len(self.sources)
         
         # Дисциплина Д2Б5 (пакетная)
         self.current_packet = -1
@@ -122,11 +151,15 @@ class SMOSystem:
         self.device_pointer = 0
 
     def boos_block(self) -> int:
-        """БООС - определение типа следующего события"""
-        # Ближайшее поступление заявки
+        """БООС - определение типа следующего события (адаптировано для N источников)"""
+        # Ближайшее поступление заявки от любого источника
         next_arrival = min(source.next_arrival_time for source in self.sources)
-        arrival_source_id = next(i for i, source in enumerate(self.sources) 
-                               if source.next_arrival_time == next_arrival)
+        
+        # Находим источник с ближайшей заявкой
+        for i, source in enumerate(self.sources):
+            if source.next_arrival_time == next_arrival:
+                arrival_source_id = i
+                break
         
         # Ближайшее освобождение прибора
         device_finish_times = [device.finish_time for device in self.devices]
@@ -138,7 +171,7 @@ class SMOSystem:
             return len(self.sources) + 1  # N+1 - освобождение прибора
 
     def process_event(self, event_type: int):
-        """Обработка события согласно блок-схеме"""
+        """Обработка события согласно блок-схеме (адаптировано для N источников)"""
         event_data = self._get_system_state()
         
         if 1 <= event_type <= len(self.sources):
@@ -175,27 +208,32 @@ class SMOSystem:
         free_device = self.find_free_device()
         
         if free_device is not None:
-            # Есть свободный прибор - обслуживаем сразу
             self.bms32_block(source, free_device)
         elif self.INDBUF < self.buffer_capacity:
-            # Все приборы заняты, но есть место в буфере
             self.bms12_block(source)
         else:
-            # Все приборы заняты и буфер полон - отказ с выбиванием
             self.bms11_block(source)
 
     def find_free_device(self) -> Optional[Device]:
-        """Поиск свободного прибора"""
-        for device in self.devices:
+        """Поиск свободного прибора по дисциплине Д2П2 (по кольцу)"""
+        # Реализация дисциплины Д2П2 - выбор прибора по кольцу
+        start_pointer = self.device_pointer
+        devices_count = len(self.devices)
+        
+        for i in range(devices_count):
+            device_index = (start_pointer + i) % devices_count
+            device = self.devices[device_index]
+            
             if not device.is_busy:
+                self.device_pointer = (device_index + 1) % devices_count
                 return device
+        
         return None
 
     def find_device_to_free(self) -> Device:
         """Определение прибора, который освободился"""
-        # Находим прибор с минимальным временем освобождения
         min_finish_time = float('inf')
-        result_device = self.devices[0]  # По умолчанию берем первый
+        result_device = self.devices[0]
         
         for device in self.devices:
             if device.finish_time < min_finish_time:
@@ -209,10 +247,8 @@ class SMOSystem:
         device.current_source = None
         
         if self.INDBUF > 0:
-            # В буфере есть заявки - выбираем следующую
             self.bms31_block(device)
         else:
-            # Буфер пуст - прибор остается свободным
             device.finish_time = float('inf')
 
     def bms11_block(self, source: Source):
@@ -248,7 +284,7 @@ class SMOSystem:
         """БМС12/БМС22 - запись в буфер по дисциплине Д10З2"""
         write_position = -1
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] == -1:  # Пустой слот
+            if self.BUFN[i] == -1:
                 write_position = i
                 break
         
@@ -324,7 +360,6 @@ class SMOSystem:
 
     def bms32_block(self, source: Source, device: Device):
         """БМС32 - обслуживание без буфера при свободном приборе"""
-        # Обслуживание заявки напрямую
         service_time = device.generate_service_time()
         device.finish_time = self.current_time + service_time
         device.is_busy = True
@@ -352,21 +387,22 @@ class SMOSystem:
         self.step_controller.wait_for_step('device_start', event_data)
 
     def find_victim_for_rejection(self) -> int:
-        """Поиск заявки для выбивания по приоритету источника (Д10О2)"""
+        """Поиск заявки для выбивания по дисциплине Д10О2 (адаптировано для N источников)"""
         candidates = []
         
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] != -1:  # Занятый слот
+            if self.BUFN[i] != -1:
                 source_id = self.BUFN[i]
-                priority = source_id + 1  # Источник 0 имеет высший приоритет (1), источник 1 - низший (2)
+                # Источник с меньшим ID имеет высший приоритет
+                priority = source_id + 1
                 candidates.append((priority, self.BUFT[i], i, source_id))
         
-        # Сортируем по приоритету (возрастание) и времени поступления (старые first)
+        # Сортируем по приоритету (возрастание) и времени поступления
         candidates.sort(key=lambda x: (x[0], x[1]))
         return candidates[0][2] if candidates else 0
 
     def select_request_from_buffer(self) -> int:
-        """Выбор заявки из буфера по пакетной дисциплине Д2Б5"""
+        """Выбор заявки из буфера по пакетной дисциплине Д2Б5 (адаптировано для N источников)"""
         if self.current_packet == -1 or self.packet_empty:
             self.select_new_packet()
         
@@ -382,10 +418,10 @@ class SMOSystem:
             if self.BUFN[i] == self.current_packet:
                 return i
         
-        return -1  # Буфер пуст
+        return -1
 
     def select_new_packet(self):
-        """Выбор нового пакета для обслуживания"""
+        """Выбор нового пакета для обслуживания (адаптировано для N источников)"""
         old_packet = self.current_packet
         
         # Ищем источники, имеющие заявки в буфере
@@ -395,11 +431,8 @@ class SMOSystem:
                 available_sources.add(self.BUFN[i])
         
         if available_sources:
-            # Выбираем источник с наивысшим приоритетом (источник 0)
-            if 0 in available_sources:
-                self.current_packet = 0
-            else:
-                self.current_packet = 1
+            # Выбираем источник с наивысшим приоритетом (минимальный ID)
+            self.current_packet = min(available_sources)
             self.packet_empty = False
         else:
             self.current_packet = -1
@@ -423,7 +456,7 @@ class SMOSystem:
             self.INDBUF = max(0, self.INDBUF - 1)
 
     def _get_system_state(self) -> Dict[str, Any]:
-        """Получение текущего состояния системы"""
+        """Получение текущего состояния системы (адаптировано для N источников и M приборов)"""
         buffer_state = []
         for i in range(self.buffer_capacity):
             if self.BUFN[i] != -1:
@@ -431,23 +464,23 @@ class SMOSystem:
             else:
                 buffer_state.append(f"{i+1}:__")
         
-        # Состояние приборов (обработчиков)
-        devices_state = []
-        for device in self.devices:
-            if device.is_busy and device.current_source is not None:
-                devices_state.append(f"П{device.id+1}[И{device.current_source.id+1}]")
-            else:
-                devices_state.append(f"П{device.id+1}[...]")
+        # Состояние приборов
+        devices_state = [str(device) for device in self.devices]
         
         # Следующие заявки от источников
         next_arrivals = []
         for i, source in enumerate(self.sources):
             next_arrivals.append(f"И{i+1}={source.next_arrival_time:.3f}")
         
-        # СТАТИСТИКА ПО ОБРАБОТЧИКАМ - сколько заявок обработал каждый прибор
+        # Статистика по приборам
         devices_processed = []
         for i, device in enumerate(self.devices):
             devices_processed.append(f"П{i+1}[{device.processed_count}]")
+        
+        # Статистика по источникам
+        sources_stats = []
+        for i, source in enumerate(self.sources):
+            sources_stats.append(f"И{i+1}[{source.generated_count}]")
         
         return {
             'time': self.current_time,
@@ -456,7 +489,8 @@ class SMOSystem:
             'buffer_capacity': self.buffer_capacity,
             'devices_state': devices_state,
             'next_arrivals': next_arrivals,
-            'devices_processed': devices_processed,  # Статистика по обработчикам
+            'devices_processed': devices_processed,
+            'sources_stats': sources_stats,
             'total_rejected': self.KOTK,
             'current_packet': self.current_packet,
             'tau': self.current_tau
@@ -469,7 +503,6 @@ class SMOSystem:
         iteration = 0
         max_iterations = 100000
         
-        # Продолжаем пока все источники не сгенерируют минимальное количество заявок
         while (all(source.generated_count >= self.min_requests for source in self.sources) is False 
                and iteration < max_iterations):
             iteration += 1
@@ -492,7 +525,7 @@ class SMOSystem:
         return self.calculate_results()
 
     def calculate_results(self) -> Dict[str, Any]:
-        """Расчет результатов реализации"""
+        """Расчет результатов реализации (адаптировано для N источников)"""
         total_requests = sum(source.generated_count for source in self.sources)
         total_processed = sum(source.processed_count for source in self.sources)
         total_reject_prob = self.KOTK / total_requests if total_requests > 0 else 0
