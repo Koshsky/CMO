@@ -3,9 +3,47 @@
 """
 
 import json
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 from src.utils.step_mode import StepModeController
 from src.utils.distributions import uniform_distribution, exponential_distribution
+
+class Source:
+    """Класс источника заявок"""
+    def __init__(self, source_id: int, params: Dict[str, float]):
+        self.id = source_id
+        self.params = params
+        self.generated_count = 0
+        self.processed_count = 0
+        self.rejected_count = 0
+        self.total_wait_time = 0.0
+        self.next_arrival_time = 0.0
+
+    def generate_interval(self) -> float:
+        """Генерация интервала между заявками по закону ИЗ2 (равномерный)"""
+        return uniform_distribution(self.params['min_interval'], self.params['max_interval'])
+
+    def __str__(self):
+        return f"И{self.id+1}"
+
+class Device:
+    """Класс прибора (обработчика)"""
+    def __init__(self, device_id: int, service_lambda: float):
+        self.id = device_id
+        self.service_lambda = service_lambda
+        self.is_busy = False
+        self.current_source = None
+        self.processed_count = 0
+        self.finish_time = float('inf')
+
+    def generate_service_time(self) -> float:
+        """Генерация времени обслуживания по закону ПЗ1 (экспоненциальный)"""
+        return exponential_distribution(self.service_lambda)
+
+    def __str__(self):
+        if self.is_busy:
+            return f"П{self.id+1}[И{self.current_source.id+1}]"
+        else:
+            return f"П{self.id+1}[...]"
 
 class SMOSystem:
     """Полная реализация СМО для варианта №6"""
@@ -17,55 +55,64 @@ class SMOSystem:
     
     def initialize_system(self):
         """Инициализация системы согласно блок-схеме"""
-        # Общие параметры
         self.buffer_capacity = self.config['buffer']['size']
         self.min_requests = self.config['simulation']['min_requests']
         
-        # Параметры источников (ИЗ2 - равномерный закон)
-        self.source_params = [
-            self.config['sources']['params']['source_0'],
-            self.config['sources']['params']['source_1']
-        ]
+        # Инициализация источников
+        self.sources = []
+        sources_config = self.config['sources']
+        for i in range(sources_config['count']):
+            source_params = sources_config['params'][f'source_{i}']
+            self.sources.append(Source(i, source_params))
         
-        # Параметры прибора (ПЗ1 - экспоненциальный закон)
-        self.service_lambda = self.config['device']['lambda']
-        self.tau_range = self.config['device']['tau_range']
+        # Инициализация приборов - с проверкой наличия count
+        self.devices = []
+        device_config = self.config['device']
+        
+        # Определяем количество приборов (по умолчанию 2 для варианта №6)
+        devices_count = device_config.get('count', 2)
+        
+        for i in range(devices_count):
+            self.devices.append(Device(i, device_config['lambda']))
         
         # Дисциплины
         self.disciplines = self.config['buffer']['disciplines']
         
-        # Текущие значения для реализации
+        # Параметры моделирования
+        self.tau_range = self.config['device']['tau_range']
         self.current_tau = self.tau_range['min']
         self.current_time = 0.0
         self.realization_results = []
         
-        print("Система инициализирована для варианта №6")
+        print(f"Система инициализирована: {len(self.sources)} источников, {len(self.devices)} приборов")
 
     def initialize_realization(self):
         """Инициализация переменных для одной реализации"""
-        # Временные параметры
         self.current_time = 0.0
-        self.TPOST = [0.0, 0.0]  # Время следующей заявки от источников
-        self.TOSV = 0.0          # Время освобождения прибора
-        self.device_busy = False
         
-        # Буфер (БМС)
+        # Сброс состояний источников
+        for source in self.sources:
+            source.generated_count = 0
+            source.processed_count = 0
+            source.rejected_count = 0
+            source.total_wait_time = 0.0
+            source.next_arrival_time = source.generate_interval()
+        
+        # Сброс состояний приборов
+        for device in self.devices:
+            device.is_busy = False
+            device.current_source = None
+            device.processed_count = 0
+            device.finish_time = float('inf')
+            
+        # Буфер
         self.INDBUF = 0
         self.BUFT = [0.0] * self.buffer_capacity
-        self.BUFN = [0] * self.buffer_capacity
-        self.buffer_pointer = 0  # Для дисциплины по кольцу
-        
-        # Счетчики (БМС) - ОБЩИЕ для системы
-        self.KOL = [0, 0]    # Общее количество заявок по источникам
-        self.KOTK = 0        # ОБЩИЙ счетчик отказов для системы
-        self.KOBR = [0, 0]   # Количество обработанных по источникам
-        self.TOG = [0.0, 0.0] # Суммарное время ожидания по источникам
+        self.BUFN = [-1] * self.buffer_capacity  # -1 означает пустой слот
         
         # Вспомогательные переменные
-        self.NMIN = 0
-        self.NOMBUF = 0
-        self.NOMOB = 0
-        self.TOB = 0.0
+        self.KOTK = 0  # Общий счетчик отказов
+        self.TOG = [0.0] * len(self.sources)  # Суммарное время ожидания по источникам
         
         # Дисциплина Д2Б5 (пакетная)
         self.current_packet = -1
@@ -73,191 +120,190 @@ class SMOSystem:
         
         # Дисциплина Д2П2 (выбор прибора по кольцу)
         self.device_pointer = 0
-        
-        # Генерация первых заявок
-        self.TPOST[0] = self.generate_interval(0)
-        self.TPOST[1] = self.generate_interval(1)
-
-    def generate_interval(self, source_num: int) -> float:
-        """Генерация интервала между заявками по закону ИЗ2 (равномерный)"""
-        params = self.source_params[source_num]
-        return uniform_distribution(params['min_interval'], params['max_interval'])
-
-    def generate_service_time(self) -> float:
-        """Генерация времени обслуживания по закону ПЗ1 (экспоненциальный)"""
-        return exponential_distribution(self.service_lambda)
 
     def boos_block(self) -> int:
-        """БООС - выбор ближайшего события"""
-        # Определяем ближайшее событие
-        next_arrival = min(self.TPOST[0], self.TPOST[1])
+        """БООС - определение типа следующего события"""
+        # Ближайшее поступление заявки
+        next_arrival = min(source.next_arrival_time for source in self.sources)
+        arrival_source_id = next(i for i, source in enumerate(self.sources) 
+                               if source.next_arrival_time == next_arrival)
         
-        if not self.device_busy:
-            # Прибор свободен - следующее событие всегда поступление заявки
-            if self.TPOST[0] < self.TPOST[1]:
-                self.NMIN = 0
-                return 1
-            else:
-                self.NMIN = 1
-                return 2
+        # Ближайшее освобождение прибора
+        device_finish_times = [device.finish_time for device in self.devices]
+        next_device_free = min(device_finish_times) if device_finish_times else float('inf')
+        
+        if next_arrival <= next_device_free:
+            return arrival_source_id + 1  # 1..N - события от источников
         else:
-            # Прибор занят - сравниваем поступление заявок и освобождение прибора
-            if next_arrival < self.TOSV:
-                if self.TPOST[0] < self.TPOST[1]:
-                    self.NMIN = 0
-                    return 1
-                else:
-                    self.NMIN = 1
-                    return 2
-            else:
-                return 3
+            return len(self.sources) + 1  # N+1 - освобождение прибора
 
     def process_event(self, event_type: int):
         """Обработка события согласно блок-схеме"""
         event_data = self._get_system_state()
         
-        if event_type == 1 or event_type == 2:
+        if 1 <= event_type <= len(self.sources):
             # Событие от источника
-            source = 0 if event_type == 1 else 1
-            self.NMIN = source
+            source_id = event_type - 1
+            source = self.sources[source_id]
             
             event_data.update({
                 'event_type': 'arrival',
-                'source': source,
-                'arrival_time': self.TPOST[source]
+                'source': source_id,
+                'source_name': f'И{source_id+1}',
+                'arrival_time': source.next_arrival_time
             })
             self.step_controller.wait_for_step('arrival', event_data)
             
             self.bas_block(source)
             
-        elif event_type == 3:
+        elif event_type == len(self.sources) + 1:
             # Событие освобождения прибора
+            device = self.find_device_to_free()
+            
             event_data.update({
                 'event_type': 'device_free',
-                'device_free_time': self.TOSV
+                'device': device.id,
+                'device_name': f'П{device.id+1}',
+                'device_free_time': device.finish_time
             })
             self.step_controller.wait_for_step('device_finish', event_data)
             
-            self.bas3_block()
+            self.bas3_block(device)
 
-    def bas_block(self, source: int):
+    def bas_block(self, source: Source):
         """БАС1/БАС2 - анализ состояния при поступлении заявки"""
-        if not self.device_busy:
-            # Прибор свободен - БМС32 (обслуживание без буфера)
-            self.bms32_block(source)
+        free_device = self.find_free_device()
+        
+        if free_device is not None:
+            # Есть свободный прибор - обслуживаем сразу
+            self.bms32_block(source, free_device)
         elif self.INDBUF < self.buffer_capacity:
-            # Прибор занят, но есть место в буфере - БМС12/БМС22
+            # Все приборы заняты, но есть место в буфере
             self.bms12_block(source)
         else:
-            # Прибор занят и буфер полон - БМС11/БМС21 (отказ с выбиванием)
+            # Все приборы заняты и буфер полон - отказ с выбиванием
             self.bms11_block(source)
 
-    def bas3_block(self):
+    def find_free_device(self) -> Optional[Device]:
+        """Поиск свободного прибора"""
+        for device in self.devices:
+            if not device.is_busy:
+                return device
+        return None
+
+    def find_device_to_free(self) -> Device:
+        """Определение прибора, который освободился"""
+        # Находим прибор с минимальным временем освобождения
+        min_finish_time = float('inf')
+        result_device = self.devices[0]  # По умолчанию берем первый
+        
+        for device in self.devices:
+            if device.finish_time < min_finish_time:
+                min_finish_time = device.finish_time
+                result_device = device
+        return result_device
+
+    def bas3_block(self, device: Device):
         """БАС3 - анализ состояния при освобождении прибора"""
-        self.device_busy = False
-        self.device_current_source = -1
+        device.is_busy = False
+        device.current_source = None
         
         if self.INDBUF > 0:
-            # В буфере есть заявки - БМС31
-            self.bms31_block()
+            # В буфере есть заявки - выбираем следующую
+            self.bms31_block(device)
         else:
             # Буфер пуст - прибор остается свободным
-            self.TOSV = float('inf')
-            
-            event_data = self._get_system_state()
-            event_data.update({
-                'event_type': 'device_finish',
-                'device_free_time': self.current_time,
-                'reason': 'Буфер пуст, прибор свободен'
-            })
-            self.step_controller.wait_for_step('device_finish', event_data)
+            device.finish_time = float('inf')
 
-    def bms11_block(self, source: int):
-        """БМС11/БМС21 - отказ с выбиванием (Д10О2)"""
-        # Находим заявку для выбивания (источник с наименьшим приоритетом)
+    def bms11_block(self, source: Source):
+        """БМС11/БМС21 - отказ с выбиванием по дисциплине Д10О2"""
         victim_index = self.find_victim_for_rejection()
-        victim_source = self.BUFN[victim_index]
+        victim_source_id = self.BUFN[victim_index]
         
-        # Увеличиваем ОБЩИЙ счетчик отказов
         self.KOTK += 1
+        source.rejected_count += 1
         
         # Заменяем выбитую заявку на новую
-        self.BUFT[victim_index] = self.TPOST[source]
-        self.BUFN[victim_index] = source
+        self.BUFT[victim_index] = source.next_arrival_time
+        self.BUFN[victim_index] = source.id
         
         # Генерация следующей заявки и обновление счетчиков
-        self.generate_next_request(source)
+        source.generated_count += 1
+        source.next_arrival_time = self.current_time + source.generate_interval()
         
         event_data = self._get_system_state()
         event_data.update({
             'event_type': 'buffer_reject',
-            'source': source,
-            'rejected_source': victim_source,
+            'source': source.id,
+            'source_name': f'И{source.id+1}',
+            'rejected_source': victim_source_id,
+            'rejected_source_name': f'И{victim_source_id+1}',
             'buffer_position': victim_index,
-            'total_rejects': self.KOTK,  # Добавляем общее количество отказов
-            'reason': f'Выбивание заявки И{victim_source + 1}'
+            'total_rejects': self.KOTK,
+            'reason': f'Выбивание заявки И{victim_source_id+1}'
         })
         self.step_controller.wait_for_step('buffer_reject', event_data)
 
-    def bms12_block(self, source: int):
-        """БМС12/БМС22 - запись в буфер (Д10З2) при занятом приборе"""
-        # Запись в буфер в порядке поступления (Д10З2)
-        if self.disciplines['write'] == 'D10Z2':
-            # Ищем первую свободную позицию
-            write_position = -1
-            for i in range(self.buffer_capacity):
-                if self.BUFN[i] == 0 and self.BUFT[i] == 0:  # Слот пуст
-                    write_position = i
-                    break
-            
-            if write_position >= 0:
-                self.BUFT[write_position] = self.TPOST[source]
-                self.BUFN[write_position] = source
-                self.INDBUF += 1
+    def bms12_block(self, source: Source):
+        """БМС12/БМС22 - запись в буфер по дисциплине Д10З2"""
+        write_position = -1
+        for i in range(self.buffer_capacity):
+            if self.BUFN[i] == -1:  # Пустой слот
+                write_position = i
+                break
         
-        # Генерация следующей заявки и обновление счетчиков
-        self.KOL[source] += 1
-        self.TPOST[source] = self.current_time + self.generate_interval(source)
+        if write_position >= 0:
+            self.BUFT[write_position] = source.next_arrival_time
+            self.BUFN[write_position] = source.id
+            self.INDBUF += 1
+        
+        # Обновление источника
+        source.generated_count += 1
+        source.next_arrival_time = self.current_time + source.generate_interval()
         
         event_data = self._get_system_state()
         event_data.update({
             'event_type': 'buffer_write',
-            'source': source,
+            'source': source.id,
+            'source_name': f'И{source.id+1}',
             'buffer_position': write_position,
             'buffer_size': self.INDBUF,
-            'reason': 'Прибор занят, заявка поставлена в буфер'
+            'reason': 'Все приборы заняты, заявка поставлена в буфер'
         })
         self.step_controller.wait_for_step('buffer_write', event_data)
 
-    def bms31_block(self):
-        """БМС31 - выборка из буфера на обслуживание (Д2Б5 + Д2П2)"""
-        # Выбор заявки по дисциплине Д2Б5 (пакетная)
+    def bms31_block(self, device: Device):
+        """БМС31 - выборка из буфера на обслуживание по дисциплине Д2Б5"""
         selected_index = self.select_request_from_buffer()
         
         if selected_index >= 0:
-            self.NOMOB = self.BUFN[selected_index]
-            self.TOB = self.BUFT[selected_index]
+            source_id = self.BUFN[selected_index]
+            source = self.sources[source_id]
+            arrival_time = self.BUFT[selected_index]
             
             # Расчет времени ожидания
-            wait_time = self.current_time - self.TOB
-            self.TOG[self.NOMOB] += wait_time
+            wait_time = self.current_time - arrival_time
+            source.total_wait_time += wait_time
+            self.TOG[source_id] += wait_time
             
             # Обслуживание заявки
-            service_time = self.generate_service_time()
-            self.TOSV = self.current_time + service_time
-            self.device_busy = True
-            self.device_current_source = self.NOMOB
+            service_time = device.generate_service_time()
+            device.finish_time = self.current_time + service_time
+            device.is_busy = True
+            device.current_source = source
             
-            # Удаление заявки из буфера
+            # Удаление из буфера и обновление счетчиков
             self.remove_from_buffer(selected_index)
-            
-            # Обновление счетчиков
-            self.KOBR[self.NOMOB] += 1
+            device.processed_count += 1
+            source.processed_count += 1
             
             event_data = self._get_system_state()
             event_data.update({
                 'event_type': 'buffer_select',
-                'selected_source': self.NOMOB,
+                'selected_source': source_id,
+                'selected_source_name': f'И{source_id+1}',
+                'device': device.id,
+                'device_name': f'П{device.id+1}',
                 'buffer_position': selected_index,
                 'wait_time': wait_time,
                 'service_time': service_time,
@@ -267,75 +313,76 @@ class SMOSystem:
             
             event_data.update({
                 'event_type': 'device_start', 
-                'source': self.NOMOB,
-                'finish_time': self.TOSV,
+                'source': source_id,
+                'source_name': f'И{source_id+1}',
+                'device': device.id,
+                'device_name': f'П{device.id+1}',
+                'finish_time': device.finish_time,
                 'from_buffer': True
             })
             self.step_controller.wait_for_step('device_start', event_data)
 
-    def bms32_block(self, source: int):
-        """БМС32 - обслуживание без буфера (при свободном приборе)"""
-        # Обслуживание заявки, пришедшей напрямую на свободный прибор
-        self.NOMOB = source
-        self.TOB = self.TPOST[source]
-        
-        service_time = self.generate_service_time()
-        self.TOSV = self.current_time + service_time
-        self.device_busy = True
-        self.device_current_source = source
+    def bms32_block(self, source: Source, device: Device):
+        """БМС32 - обслуживание без буфера при свободном приборе"""
+        # Обслуживание заявки напрямую
+        service_time = device.generate_service_time()
+        device.finish_time = self.current_time + service_time
+        device.is_busy = True
+        device.current_source = source
         
         # Обновление счетчиков
-        self.KOBR[source] += 1
-        self.KOL[source] += 1
+        device.processed_count += 1
+        source.processed_count += 1
+        source.generated_count += 1
         
         # Генерация следующей заявки
-        self.TPOST[source] = self.current_time + self.generate_interval(source)
+        source.next_arrival_time = self.current_time + source.generate_interval()
         
         event_data = self._get_system_state()
         event_data.update({
             'event_type': 'device_start',
-            'source': source,
+            'source': source.id,
+            'source_name': f'И{source.id+1}',
+            'device': device.id,
+            'device_name': f'П{device.id+1}',
             'service_time': service_time,
-            'finish_time': self.TOSV,
-            'direct_service': True  # Прямое обслуживание без буфера
+            'finish_time': device.finish_time,
+            'direct_service': True
         })
         self.step_controller.wait_for_step('device_start', event_data)
 
     def find_victim_for_rejection(self) -> int:
-        """Найти заявку для выбивания по дисциплине Д10О2"""
-        # Приоритет по номеру источника (источник 0 имеет высший приоритет)
+        """Поиск заявки для выбивания по приоритету источника (Д10О2)"""
         candidates = []
         
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] != 0 or self.BUFT[i] != 0:  # Слот занят
-                source = self.BUFN[i]
-                priority = 1 if source == 0 else 2  # Меньше число - выше приоритет
-                candidates.append((priority, self.BUFT[i], i, source))
+            if self.BUFN[i] != -1:  # Занятый слот
+                source_id = self.BUFN[i]
+                priority = source_id + 1  # Источник 0 имеет высший приоритет (1), источник 1 - низший (2)
+                candidates.append((priority, self.BUFT[i], i, source_id))
         
-        # Сортируем по приоритету (возрастание), затем по времени (старые first)
+        # Сортируем по приоритету (возрастание) и времени поступления (старые first)
         candidates.sort(key=lambda x: (x[0], x[1]))
-        
         return candidates[0][2] if candidates else 0
 
     def select_request_from_buffer(self) -> int:
-        """Выбор заявки из буфера по дисциплине Д2Б5 (пакетная)"""
-        # Если текущий пакет не установлен или пуст, выбираем новый
+        """Выбор заявки из буфера по пакетной дисциплине Д2Б5"""
         if self.current_packet == -1 or self.packet_empty:
             self.select_new_packet()
         
-        # Ищем заявку текущего пакета в буфере
+        # Ищем заявку текущего пакета
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] == self.current_packet and self.BUFT[i] > 0:
+            if self.BUFN[i] == self.current_packet:
                 self.packet_empty = False
                 return i
         
         # Если заявок текущего пакета нет, выбираем новый пакет
         self.select_new_packet()
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] == self.current_packet and self.BUFT[i] > 0:
+            if self.BUFN[i] == self.current_packet:
                 return i
         
-        return -1  # Не должно происходить
+        return -1  # Буфер пуст
 
     def select_new_packet(self):
         """Выбор нового пакета для обслуживания"""
@@ -344,7 +391,7 @@ class SMOSystem:
         # Ищем источники, имеющие заявки в буфере
         available_sources = set()
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] != 0 or self.BUFT[i] != 0:
+            if self.BUFN[i] != -1:
                 available_sources.add(self.BUFN[i])
         
         if available_sources:
@@ -368,59 +415,50 @@ class SMOSystem:
             })
             self.step_controller.wait_for_step('packet_change', event_data)
 
-    def select_device(self):
-        """Выбор прибора по дисциплине Д2П2 (по кольцу)"""
-        # В данной реализации один прибор, поэтому просто увеличиваем указатель
-        self.device_pointer = (self.device_pointer + 1) % 1  # 1 прибор
-
     def remove_from_buffer(self, index: int):
-        """Удаление заявки из буфера со сдвигом"""
-        if index < 0 or index >= self.buffer_capacity:
-            return
-            
-        # Сдвигаем элементы буфера
-        for i in range(index, self.buffer_capacity - 1):
-            self.BUFT[i] = self.BUFT[i + 1]
-            self.BUFN[i] = self.BUFN[i + 1]
-        
-        # Очищаем последний элемент
-        self.BUFT[self.buffer_capacity - 1] = 0.0
-        self.BUFN[self.buffer_capacity - 1] = 0
-        self.INDBUF = max(0, self.INDBUF - 1)
-
-    def generate_next_request(self, source: int):
-        """Генерация следующей заявки от источника"""
-        self.TPOST[source] = self.current_time + self.generate_interval(source)
-        self.KOL[source] += 1
+        """Удаление заявки из буфера"""
+        if 0 <= index < self.buffer_capacity:
+            self.BUFT[index] = 0.0
+            self.BUFN[index] = -1
+            self.INDBUF = max(0, self.INDBUF - 1)
 
     def _get_system_state(self) -> Dict[str, Any]:
-        """Получить текущее состояние системы"""
+        """Получение текущего состояния системы"""
         buffer_state = []
         for i in range(self.buffer_capacity):
-            if self.BUFN[i] != 0 or self.BUFT[i] != 0:
-                buffer_state.append(self.BUFN[i])
+            if self.BUFN[i] != -1:
+                buffer_state.append(f"{i+1}:И{self.BUFN[i]+1}")
             else:
-                buffer_state.append(None)
+                buffer_state.append(f"{i+1}:__")
+        
+        # Состояние приборов (обработчиков)
+        devices_state = []
+        for device in self.devices:
+            if device.is_busy and device.current_source is not None:
+                devices_state.append(f"П{device.id+1}[И{device.current_source.id+1}]")
+            else:
+                devices_state.append(f"П{device.id+1}[...]")
+        
+        # Следующие заявки от источников
+        next_arrivals = []
+        for i, source in enumerate(self.sources):
+            next_arrivals.append(f"И{i+1}={source.next_arrival_time:.3f}")
+        
+        # СТАТИСТИКА ПО ОБРАБОТЧИКАМ - сколько заявок обработал каждый прибор
+        devices_processed = []
+        for i, device in enumerate(self.devices):
+            devices_processed.append(f"П{i+1}[{device.processed_count}]")
         
         return {
             'time': self.current_time,
             'buffer_state': buffer_state,
             'buffer_size': self.INDBUF,
             'buffer_capacity': self.buffer_capacity,
-            'buffer_pointer': self.buffer_pointer,
-            'device_busy': self.device_busy,
-            'device_source': self.NOMOB if self.device_busy else -1,
-            'device_finish_time': self.TOSV,
-            'next_arrival_1': self.TPOST[0],
-            'next_arrival_2': self.TPOST[1],
+            'devices_state': devices_state,
+            'next_arrivals': next_arrivals,
+            'devices_processed': devices_processed,  # Статистика по обработчикам
+            'total_rejected': self.KOTK,
             'current_packet': self.current_packet,
-            'statistics': {
-                'total_1': self.KOL[0],
-                'total_2': self.KOL[1],
-                'processed_1': self.KOBR[0],
-                'processed_2': self.KOBR[1],
-                'total_rejected': self.KOTK,  # Теперь общее количество отказов
-            },
             'tau': self.current_tau
         }
 
@@ -429,37 +467,34 @@ class SMOSystem:
         self.initialize_realization()
         
         iteration = 0
-        max_iterations = 100000  # Защита от бесконечного цикла
+        max_iterations = 100000
         
-        while (self.KOL[0] < self.min_requests or self.KOL[1] < self.min_requests) and iteration < max_iterations:
+        # Продолжаем пока все источники не сгенерируют минимальное количество заявок
+        while (all(source.generated_count >= self.min_requests for source in self.sources) is False 
+               and iteration < max_iterations):
             iteration += 1
             
-            # БООС - определение следующего события
             event_type = self.boos_block()
             
             if event_type == 0:
-                break  # Нет событий
+                break
                 
-            # Обновляем текущее время
-            if event_type == 1:
-                self.current_time = self.TPOST[0]
-            elif event_type == 2:
-                self.current_time = self.TPOST[1]
-            elif event_type == 3:
-                self.current_time = self.TOSV
+            # Обновление текущего времени
+            if 1 <= event_type <= len(self.sources):
+                source_id = event_type - 1
+                self.current_time = self.sources[source_id].next_arrival_time
+            else:
+                device = self.find_device_to_free()
+                self.current_time = device.finish_time
             
-            # Обработка события
             self.process_event(event_type)
         
-        # Расчет результатов реализации
         return self.calculate_results()
 
     def calculate_results(self) -> Dict[str, Any]:
         """Расчет результатов реализации"""
-        total_requests = self.KOL[0] + self.KOL[1]
-        total_processed = self.KOBR[0] + self.KOBR[1]
-        
-        # Общая вероятность отказа для системы
+        total_requests = sum(source.generated_count for source in self.sources)
+        total_processed = sum(source.processed_count for source in self.sources)
         total_reject_prob = self.KOTK / total_requests if total_requests > 0 else 0
         
         results = {
@@ -471,28 +506,31 @@ class SMOSystem:
                 'total_reject_prob': total_reject_prob
             },
             'sources_stats': [],
-            'device_stats': [],
+            'devices_stats': [],
             'realization_data': self._get_system_state()
         }
         
-        # Статистика по источникам (только обработанные заявки)
-        for i in range(2):
-            avg_wait_time = self.TOG[i] / self.KOBR[i] if self.KOBR[i] > 0 else 0
-            avg_service_time = self.current_tau  # Для упрощения
+        # Статистика по источникам
+        for source in self.sources:
+            avg_wait_time = source.total_wait_time / source.processed_count if source.processed_count > 0 else 0
             
             results['sources_stats'].append({
-                'total': self.KOL[i],
-                'processed': self.KOBR[i],
-                'avg_wait_time': avg_wait_time,
-                'avg_system_time': avg_wait_time + avg_service_time
+                'source_id': source.id,
+                'source_name': f'И{source.id+1}',
+                'total': source.generated_count,
+                'processed': source.processed_count,
+                'rejected': source.rejected_count,
+                'avg_wait_time': avg_wait_time
             })
         
         # Статистика по приборам
-        utilization = self.current_time > 0  # Упрощенный расчет
-        results['device_stats'].append({
-            'utilization': utilization,
-            'total_working_time': self.current_time
-        })
+        for device in self.devices:
+            results['devices_stats'].append({
+                'device_id': device.id,
+                'device_name': f'П{device.id+1}',
+                'processed': device.processed_count,
+                'utilization': device.processed_count > 0
+            })
         
         return results
 

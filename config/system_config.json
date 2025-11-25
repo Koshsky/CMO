@@ -20,6 +20,7 @@
             ]
         },
         "device": {
+            "count": 2,
             "distribution": "exponential",
             "lambda": 0.5,
             "tau_range": {

@@ -144,59 +144,30 @@ class StepModeController:
         """Отображение текущего состояния системы"""
         print(f"\n--- ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ ---")
         
-        # Приборы
-        device_busy = event_data.get('device_busy', False)
-        device_source = event_data.get('device_source', -1)
-        
-        # Всегда показываем оба источника в статусе приборов
-        device_status = []
-        for i in range(2):  # Для двух источников
-            if device_busy and device_source == i:
-                device_status.append(f"И{i+1}[!!!]")  # Занят
-            else:
-                device_status.append(f"И{i+1}[...]")  # Свободен
-        
-        print(f"Приборы: {', '.join(device_status)}")
+        # Приборы - состояние обработчиков
+        devices_state = event_data.get('devices_state', [])
+        print(f"Приборы: {', '.join(devices_state)}")
         
         # Буфер
         buffer_state = event_data.get('buffer_state', [])
         buffer_size = event_data.get('buffer_size', 0)
         buffer_capacity = event_data.get('buffer_capacity', 4)
         
-        buffer_display = []
-        for i, slot in enumerate(buffer_state):
-            if slot is not None:  # слот занят
-                buffer_display.append(f"[{i+1}:И{slot+1}]")
-            else:
-                buffer_display.append(f"[{i+1}:__]")
+        print(f"Буфер [{buffer_size}/{buffer_capacity}]: {' '.join(buffer_state)}")
         
-        print(f"Буфер [{buffer_size}/{buffer_capacity}]: {' '.join(buffer_display)}")
-        
-        # Следующие события - всегда показываем оба источника
-        next_arrivals = []
-        for i in range(2):  # Для двух источников
-            arrival_key = f'next_arrival_{i}'
-            if arrival_key in event_data:
-                next_arrivals.append(f"И{i+1}={event_data[arrival_key]:.3f}")
-        
+        # Следующие заявки от источников
+        next_arrivals = event_data.get('next_arrivals', [])
         if next_arrivals:
             print(f"След. заявки: {', '.join(next_arrivals)}")
         
-        # Статистика - всегда показываем оба источника
-        stats = event_data.get('statistics', {})
-        if stats:
-            # Обработанные заявки по источникам - всегда показываем оба
-            processed = []
-            for i in range(2):  # Для двух источников
-                processed_count = stats.get(f'processed_{i}', 0)
-                processed.append(f"И{i+1}[{processed_count:2d}]")
-            
-            if processed:
-                print(f"Обработано: {', '.join(processed)}")
-            
-            # Общее количество отказов
-            total_rejected = stats.get('total_rejected', 0)
-            print(f"Отказано: {total_rejected}")
+        # ОБРАБОТАНО ПО ОБРАБОТЧИКАМ (приборам) - это главное изменение!
+        devices_processed = event_data.get('devices_processed', [])
+        if devices_processed:
+            print(f"Обработано: {', '.join(devices_processed)}")
+        
+        # Общее количество отказов
+        total_rejected = event_data.get('total_rejected', 0)
+        print(f"Отказано: {total_rejected}")
     
     def _show_control_prompt(self):
         """Показ управляющего промпта"""
