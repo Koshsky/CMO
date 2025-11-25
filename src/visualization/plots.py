@@ -26,15 +26,15 @@ class ResultsVisualizer:
         if 'sources_stats' in results:
             print("\nХАРАКТЕРИСТИКИ ИСТОЧНИКОВ:")
             print("-" * 80)
-            print(f"{'Источник':<10} {'Всего':<8} {'Обработано':<10} {'Отказов':<8} {'P_отк':<10} {'M[T_ож]':<12} {'M[T_пр]':<12} {'Загрузка':<10}")
+            print(f"{'Источник':<10} {'Всего':<8} {'Обработано':<10} {'Отказов':<8} {'M[T_ож]':<12} {'M[T_пр]':<12} {'Загрузка':<10}")
             print("-" * 80)
             
             for i, stats in enumerate(results['sources_stats']):
                 utilization = stats.get('utilization', 0)
                 print(f"{f'И{i+1}':<10} {stats['total']:<8} {stats.get('processed', 0):<10} "
-                      f"{stats['rejected']:<8} {stats['reject_prob']:<10.4f} "
-                      f"{stats['avg_wait_time']:<12.4f} {stats['avg_system_time']:<12.4f} "
-                      f"{utilization:<10.3f}")
+                    f"{stats.get('rejected', 0):<8} "
+                    f"{stats['avg_wait_time']:<12.4f} {stats['avg_system_time']:<12.4f} "
+                    f"{utilization:<10.3f}")
         
         if 'system_stats' in results:
             print(f"\nОБЩАЯ СТАТИСТИКА СИСТЕМЫ:")
@@ -42,6 +42,8 @@ class ResultsVisualizer:
             sys_stats = results['system_stats']
             print(f"Общее время моделирования: {sys_stats.get('total_time', 0):.2f}")
             print(f"Общее кол-во заявок: {sys_stats.get('total_requests', 0)}")
+            print(f"Общее кол-во отказов: {sys_stats.get('total_rejected', 0)}")
+            print(f"Общая вероятность отказа: {sys_stats.get('total_reject_prob', 0):.4f}")
             print(f"Коэффициент использования системы: {sys_stats.get('system_utilization', 0):.3f}")
             print(f"Средняя длина очереди: {sys_stats.get('avg_queue_length', 0):.3f}")
 
@@ -85,15 +87,21 @@ class ResultsVisualizer:
         
         tau_values = [r['tau'] for r in results_by_tau]
         
-        # P_отк для обоих источников
-        for i in range(2):
-            p_reject = [r['sources_stats'][i]['reject_prob'] for r in results_by_tau]
-            ax.plot(tau_values, p_reject, 'o-', linewidth=2.5, 
-                   label=f'P_отк И{i+1}', color=self.colors[i], markersize=6)
+        # Общая вероятность отказа системы
+        total_reject_prob = [r['system_stats']['total_reject_prob'] for r in results_by_tau]
+        ax.plot(tau_values, total_reject_prob, 'o-', linewidth=2.5, 
+            label='Общая P_отк', color=self.colors[0], markersize=6)
+        
+        # Дополнительные метрики если нужно
+        if 'sources_stats' in results_by_tau[0]:
+            # Можно добавить другие метрики, например время ожидания
+            wait_time_1 = [r['sources_stats'][0]['avg_wait_time'] for r in results_by_tau]
+            ax.plot(tau_values, wait_time_1, 's-', linewidth=2.5,
+                label='M[T_ож] И1', color=self.colors[1], markersize=6)
         
         ax.set_xlabel('Время обслуживания (TAU)', fontsize=11, fontweight='bold')
-        ax.set_ylabel('Вероятность отказа', fontsize=11, fontweight='bold')
-        ax.set_title('Зависимость вероятности отказа\nот времени обслуживания', 
+        ax.set_ylabel('Вероятность отказа / Время ожидания', fontsize=11, fontweight='bold')
+        ax.set_title('Зависимость характеристик\nот времени обслуживания', 
                     fontsize=12, fontweight='bold')
         ax.legend()
         ax.grid(True, alpha=0.3)
@@ -147,9 +155,10 @@ class ResultsVisualizer:
         
         tau_values = [r['tau'] for r in results_by_tau]
         
-        metrics = ['reject_prob', 'avg_wait_time', 'avg_system_time']
-        metric_names = ['Вероятность отказа', 'Время ожидания', 'Время в системе']
-        bar_width = 0.25
+        # Используем только доступные метрики
+        metrics = ['avg_wait_time', 'avg_system_time']
+        metric_names = ['Время ожидания', 'Время в системе']
+        bar_width = 0.3
         
         for metric_idx, (metric, name) in enumerate(zip(metrics, metric_names)):
             # Значения для обоих источников
@@ -159,19 +168,31 @@ class ResultsVisualizer:
             x_pos = np.arange(len(tau_values)) + metric_idx * bar_width
             
             ax.bar(x_pos - bar_width/2, values_source1, bar_width, 
-                   label=f'И1 {name}' if metric_idx == 0 else "", 
-                   color=self.colors[0], alpha=0.7)
+                label=f'И1 {name}' if metric_idx == 0 else "", 
+                color=self.colors[0], alpha=0.7)
             ax.bar(x_pos + bar_width/2, values_source2, bar_width,
-                   label=f'И2 {name}' if metric_idx == 0 else "",
-                   color=self.colors[1], alpha=0.7)
+                label=f'И2 {name}' if metric_idx == 0 else "",
+                color=self.colors[1], alpha=0.7)
+        
+        # Добавляем общую вероятность отказа на тот же график
+        ax_twin = ax.twinx()
+        total_reject_prob = [r['system_stats']['total_reject_prob'] for r in results_by_tau]
+        ax_twin.plot(np.arange(len(tau_values)) + bar_width/2, total_reject_prob, 
+                    'o-', linewidth=2.5, color='red', label='Общая P_отк', markersize=6)
         
         ax.set_xlabel('Индекс реализации (по TAU)', fontsize=11, fontweight='bold')
-        ax.set_ylabel('Значения характеристик', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Время', fontsize=11, fontweight='bold')
+        ax_twin.set_ylabel('Вероятность отказа', fontsize=11, fontweight='bold', color='red')
         ax.set_title('Сравнительный анализ характеристик источников', 
                     fontsize=12, fontweight='bold')
         ax.set_xticks(np.arange(len(tau_values)) + bar_width)
         ax.set_xticklabels([f'TAU={t:.1f}' for t in tau_values], rotation=45)
-        ax.legend()
+        
+        # Объединяем легенды
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_twin.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+        
         ax.grid(True, alpha=0.3)
 
     def _plot_enhanced_timeline(self, fig, pos, events_data: List[Dict]):
@@ -219,17 +240,12 @@ class ResultsVisualizer:
         
         tau_values = [r['tau'] for r in results_by_tau]
         
-        # Средняя длина очереди и вероятность отказа
+        # Средняя длина очереди и общая вероятность отказа
         avg_queue = [r.get('system_stats', {}).get('avg_queue_length', 0) for r in results_by_tau]
-        total_reject_prob = [
-            (r['sources_stats'][0]['reject_prob'] * r['sources_stats'][0]['total'] +
-             r['sources_stats'][1]['reject_prob'] * r['sources_stats'][1]['total']) /
-            (r['sources_stats'][0]['total'] + r['sources_stats'][1]['total'])
-            for r in results_by_tau
-        ]
+        total_reject_prob = [r['system_stats']['total_reject_prob'] for r in results_by_tau]
         
         ax.plot(tau_values, avg_queue, 'o-', linewidth=2.5, 
-               label='Средняя длина очереди', color='#FF6B6B')
+            label='Средняя длина очереди', color='#FF6B6B')
         ax_twin = ax.twinx()
         ax_twin.plot(tau_values, total_reject_prob, 's-', linewidth=2.5,
                     label='Общая P_отк', color='#4ECDC4')
