@@ -1,0 +1,13 @@
+sources:
+  TAY1: 0.1
+  TAY2: 0.5
+step_by_step:
+  enabled: true
+  max_steps: 50
+system:
+  DTAU: 0.2
+  KMIN: 3000
+  LAM1: 1.0
+  LAM2: 1.0
+  TAU1: 1.0
+  TAU2: 2.0
